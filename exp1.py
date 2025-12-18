@@ -1,104 +1,186 @@
-import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from PIL import Image
+import os
+from numba import jit  # 加速循环
 
-def detect_lane_lines(image_path):
-    # 1. 读取图像并预处理
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"无法读取图像: {image_path}")
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    result = img_rgb.copy()
-    height, width = img.shape[:2]
 
-    # 2. 颜色过滤：增强黄色检测
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    # 调整黄色阈值，扩大检测范围
-    yellow_low = np.array([15, 80, 80])    # 降低饱和度和明度下限
-    yellow_high = np.array([35, 255, 255]) # 扩大色调范围
-    yellow_mask = cv2.inRange(hsv, yellow_low, yellow_high)
-    # 白色车道线掩码
-    white_low = np.array([0, 0, 200])
-    white_high = np.array([255, 30, 255])
-    white_mask = cv2.inRange(hsv, white_low, white_high)
-    color_mask = cv2.bitwise_or(yellow_mask, white_mask)
-    color_filtered = cv2.bitwise_and(img, img, mask=color_mask)
+# ===================== 通用工具函数 =====================
+def read_image(path):
+    """读取图像（支持PNG/JPG格式），转为RGB浮点型数组（0-255）"""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"图像文件不存在：{path}")
+    img = Image.open(path).convert("RGB")
+    return np.array(img, dtype=np.float32)
 
-    # 3. 边缘检测
-    gray = cv2.cvtColor(color_filtered, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)  # 稍大核减少噪点
-    edges = cv2.Canny(blur, 50, 150)          # 降低阈值提高检测灵敏度
 
-    # 4. 优化感兴趣区域：更贴合实际车道形状
-    mask = np.zeros_like(edges)
-    # 调整多边形顶点，使区域更贴近中间黄色车道线（向左移动以匹配黄色线）
-    vertices = np.array([[
-        (width*0.35, height),         # 左下：向左移动，更靠近中间车道
-        (width*0.50, height*0.3),    # 左上：向左调整，使区域更居中
-        (width*0.40, height*0.3),    # 右上：向左调整，缩小右侧范围
-        (width*0.65, height)          # 右下：向左移动，缩小检测区域
-    ]], dtype=np.int32)
-    cv2.fillPoly(mask, vertices, 255)
-    masked_edges = cv2.bitwise_and(edges, mask)
+def save_image(img, save_path):
+    """保存图像（自动归一化到0-255并转为uint8）"""
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    # 处理单通道图像（LBP是单通道，需扩展为3通道才能正常保存）
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)  # 单通道→三通道（灰度图）
+    Image.fromarray(img).save(save_path)
+    print(f"图像已保存到：{save_path}")
 
-    # 5. 霍夫变换：优化参数检测连续线段
-    lines = cv2.HoughLinesP(
-        masked_edges,
-        rho=1,
-        theta=np.pi/180,
-        threshold=15,           # 降低阈值检测更多线段
-        minLineLength=50,       # 接受较短线段
-        maxLineGap=60           # 允许更大间隙连接断续线
+
+# ===================== 1. 卷积操作 =====================
+@jit(nopython=True)  # Numba加速卷积循环
+def convolution_jit(padded_img, kernel, h, w, c, k_size):
+    """卷积核心逻辑（Numba加速）"""
+    output = np.zeros((h, w, c), dtype=np.float32)
+    for channel in range(c):
+        for i in range(h):
+            for j in range(w):
+                neighbor = padded_img[i:i + k_size, j:j + k_size, channel]
+                output[i, j, channel] = np.sum(neighbor * kernel)
+    return output
+
+
+def convolution(img, kernel, padding_mode="constant"):
+    """通用卷积函数（支持多通道，优化大图像性能）"""
+    h, w, c = img.shape
+    k_size = kernel.shape[0]
+    if k_size % 2 == 0:
+        raise ValueError("卷积核尺寸必须为奇数")
+    pad = k_size // 2
+
+    # 补边
+    padded_img = np.pad(
+        img,
+        pad_width=((pad, pad), (pad, pad), (0, 0)),
+        mode=padding_mode
     )
 
-    # 6. 线段拟合优化：针对中间车道线调整斜率过滤
-    if lines is not None:
-        # 增加中间车道线检测逻辑（针对单条黄色车道线场景）
-        middle_lines = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            if x2 == x1:
-                continue
-            slope = (y2 - y1) / (x2 - x1)
-            # 放宽斜率限制，允许接近垂直的线段（适应中间车道线）
-            # 调整斜率范围，更严格地选择中间车道线，避免右侧干扰
-            if abs(slope) < 0.7 and abs(slope) > 0.15:  # 更严格的斜率范围
-                # 额外过滤：优先选择x坐标更靠近图像中心的线段
-                line_center_x = (x1 + x2) / 2
-                if width * 0.3 < line_center_x < width * 0.7:  # 限制在中间区域
-                    middle_lines.append(line)
+    # 调用加速后的卷积逻辑
+    output = convolution_jit(padded_img, kernel, h, w, c, k_size)
+    return output
 
-        # 拟合中间车道线（针对单条黄色车道线优化）
-        if middle_lines:
-            mid_points = np.array([[x1, y1, x2, y2] for line in middle_lines]).reshape(-1, 2)
-            # 使用加权拟合，更重视中间位置的点
-            mid_vx, mid_vy, mid_x, mid_y = cv2.fitLine(
-                mid_points, cv2.DIST_L2, 0, 0.01, 0.01
-            )
-            # 调整绘制范围，使线条更贴合实际车道长度
-            y1_mid = height
-            y2_mid = int(height * 0.2)  # 延长检测线长度
-            # 向左微调x坐标，使绿色线与黄色线更吻合
-            x_offset = -5  # 向左偏移5像素
-            x1_mid = int((y1_mid - mid_y) * mid_vx / mid_vy + mid_x) + x_offset
-            x2_mid = int((y2_mid - mid_y) * mid_vx / mid_vy + mid_x) + x_offset
-            # 绘制中间车道线
-            cv2.line(result, (x1_mid, y1_mid), (x2_mid, y2_mid), (0, 255, 0), 100)
 
-    # 7. 显示结果
-    plt.figure(figsize=(12, 10))
-    plt.subplot(221), plt.imshow(img_rgb), plt.title("原始图像")
-    plt.subplot(222), plt.imshow(color_filtered), plt.title("颜色过滤后")
-    plt.subplot(223), plt.imshow(masked_edges, cmap='gray'), plt.title("掩码边缘")
-    plt.subplot(224), plt.imshow(result), plt.title("车道线检测结果")
-    plt.tight_layout()
-    plt.show()
+def sobel_edge_detection(img):
+    """Sobel边缘检测（x+y方向合并）"""
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
 
-    # 保存结果
-    result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-    cv2.imwrite("lane_detection_optimized.jpg", result_bgr)
-    print("优化后的检测结果已保存为 lane_detection_optimized.jpg")
+    edge_x = convolution(img, sobel_x)
+    edge_y = convolution(img, sobel_y)
+    sobel_combined = np.sqrt(np.square(edge_x) + np.square(edge_y))
+    return sobel_combined, edge_x, edge_y
 
+
+# ===================== 2. 颜色直方图 =====================
+def extract_color_histogram(img, save_path="color_histogram.png"):
+    """提取RGB三通道颜色直方图"""
+    img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
+    h, w = img_uint8.shape[:2]
+
+    # 优化：用numpy内置函数统计（比双重循环快100倍+，大图像必备）
+    hist_r, _ = np.histogram(img_uint8[..., 0].flatten(), bins=256, range=(0, 255))
+    hist_g, _ = np.histogram(img_uint8[..., 1].flatten(), bins=256, range=(0, 255))
+    hist_b, _ = np.histogram(img_uint8[..., 2].flatten(), bins=256, range=(0, 255))
+
+    # 绘制柱状图
+    plt.figure(figsize=(12, 5))
+    x = np.arange(256)
+    width = 1.0  # 柱宽（填满bin）
+    plt.bar(x, hist_r, width=width, color="red", alpha=0.7, label="Red Channel")
+    plt.bar(x, hist_g, width=width, color="green", alpha=0.7, label="Green Channel")
+    plt.bar(x, hist_b, width=width, color="blue", alpha=0.7, label="Blue Channel")
+
+    plt.xlabel("Pixel Intensity (0-255)")
+    plt.ylabel("Pixel Count")
+    plt.title("RGB Color Histogram (Bar Chart)")
+    plt.legend()
+    plt.grid(alpha=0.3, axis='y')
+    plt.xlim(0, 255)  # 限制x轴范围，避免空白
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"颜色直方图已保存到：{save_path}")
+    return [hist_r, hist_g, hist_b]
+
+
+# ===================== 3. LBP纹理特征 =====================
+@jit(nopython=True)  # 加速LBP循环
+def lbp_jit(gray, h, w):
+    """LBP核心逻辑（Numba加速）"""
+    lbp_feature = np.zeros((h, w), dtype=np.uint8)
+    for i in range(1, h - 1):
+        for j in range(1, w - 1):
+            center = gray[i, j]
+            lbp_code = 0
+            # 8邻域顺时针编码
+            neighbors = [
+                gray[i - 1, j - 1], gray[i - 1, j], gray[i - 1, j + 1],
+                gray[i, j + 1], gray[i + 1, j + 1], gray[i + 1, j],
+                gray[i + 1, j - 1], gray[i, j - 1]
+            ]
+            for k in range(8):
+                if neighbors[k] > center:
+                    lbp_code |= (1 << (7 - k))
+            lbp_feature[i, j] = lbp_code
+    return lbp_feature
+
+
+def extract_lbp_texture(img, save_path="lbp_texture.npy"):
+    """提取LBP纹理特征"""
+    # 转为灰度图
+    gray = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+    h, w = gray.shape
+
+    # 调用加速后的LBP逻辑
+    lbp_feature = lbp_jit(gray, h, w)
+
+    # 保存npy文件
+    np.save(save_path, lbp_feature)
+    print(f"LBP纹理特征已保存到：{save_path}")
+
+    # 保存可视化图（单通道→三通道，避免保存错误）
+    save_image(lbp_feature, "experiment_results/lbp_visualization.png")
+    return lbp_feature
+
+
+# ===================== 主函数（整合所有任务） =====================
+def main(image_path, output_dir="experiment_results"):
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 读取图像
+    print("正在读取图像...")
+    img = read_image(image_path)
+    print(f"图像尺寸：{img.shape}")
+
+    # Sobel边缘检测
+    print("正在执行Sobel边缘检测...")
+    sobel_combined, sobel_x, sobel_y = sobel_edge_detection(img)
+    save_image(sobel_combined, os.path.join(output_dir, "sobel_combined.png"))
+    save_image(sobel_x, os.path.join(output_dir, "sobel_x.png"))
+    save_image(sobel_y, os.path.join(output_dir, "sobel_y.png"))
+
+    # 给定核滤波
+    print("正在执行给定核滤波...")
+    given_kernel = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
+    given_kernel_result = convolution(img, given_kernel)
+    save_image(given_kernel_result, os.path.join(output_dir, "given_kernel_filter.png"))
+
+    # 颜色直方图（柱状图）
+    print("正在提取颜色直方图...")
+    extract_color_histogram(img, os.path.join(output_dir, "color_histogram.png"))
+
+    # LBP纹理特征
+    print("正在提取LBP纹理特征...")
+    extract_lbp_texture(img, os.path.join(output_dir, "lbp_texture.npy"))
+
+    print("\n所有任务执行完成！结果保存在：", output_dir)
+
+
+# ===================== 运行实验 =====================
 if __name__ == "__main__":
-    image_path = "campus_road.jpg"  # 替换为你的图像路径
-    detect_lane_lines(image_path)
+    INPUT_IMAGE_PATH = "1764329365855.jpg"
+    try:
+        main(INPUT_IMAGE_PATH)
+    except Exception as e:
+        print(f"实验执行出错：{e}")
+        # 打印详细错误信息
+        import traceback
+
+        traceback.print_exc()
