@@ -4,7 +4,7 @@ from PIL import Image
 import os
 from numba import jit  # 加速循环
 
-
+#实验一
 # ===================== 通用工具函数 =====================
 def read_image(path):
     """读取图像（支持PNG/JPG格式），转为RGB浮点型数组（0-255）"""
